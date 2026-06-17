@@ -17,7 +17,7 @@ nginx (port 80) serves the frontend and proxies `/api/v1/` to the backend — no
 | **EC2 IAM Role** | `lablumen-ec2-role` |
 | **EC2 Instance Profile** | `lablumen-ec2-profile` |
 | **EC2 Security Group** | `sg-0cd62be1c32705ec0` (`lablumen-sg`) |
-| **Bedrock Models** | `amazon.titan-embed-text-v1` + `amazon.nova-2-lite-v1:0` (access granted) |
+| **Bedrock Models** | `amazon.titan-embed-text-v1` (embed) + `amazon.nova-lite-v1:0` (text). Nova 2 Lite needs a cross-region inference profile that the org SCP blocks — see docs/CURRENT_STATUS.md. |
 | **Test User** | `patient@example.com` / `Test12345!` |
 
 All values are already baked into `docker-compose.yml` — no manual editing required after clone.

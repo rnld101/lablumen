@@ -12,6 +12,11 @@ document-scoped RAG chat are all implemented and wired. The S3-triggered Lambda 
 `serverless/` is intentionally parked for the future EKS migration (it can't reach the
 docker-compose DB); ingestion runs inside report-service for this single-instance setup.
 
+**✅ Verified end-to-end on 2026-06-18** (live, against http://54.198.249.16): login + RBAC,
+patient profile + booking, booking→SQS→SES email (SES: sent, 0 bounces), staff ops queue +
+status update, report upload → Textract OCR → Nova Lite summary → Titan embeddings → pgvector,
+presigned PDF view, and grounded RAG chat. Patient→staff and no-token requests correctly 403.
+
 ## Deployment
 
 - **Model**: single EC2 (Ubuntu 24.04) running `docker compose`. nginx serves the SPA on :80 and
@@ -34,8 +39,8 @@ docker-compose DB); ingestion runs inside report-service for this single-instanc
 | S3 bucket | `lablumen-reports-130290476321` |
 | SQS queue | `https://sqs.us-east-1.amazonaws.com/130290476321/lablumen-notifications` |
 | SES sender (verified) | `rukesully@gmail.com` |
-| Bedrock models | `amazon.titan-embed-text-v1` (embed), `amazon.nova-2-lite-v1:0` (text) |
-| EC2 IAM role | `lablumen-ec2-role` (Bedrock, S3, SQS, SES, CognitoReadOnly, **Textract**, SSM) |
+| Bedrock models | `amazon.titan-embed-text-v1` (embed), **`amazon.nova-lite-v1:0`** (text) |
+| EC2 IAM role | `lablumen-ec2-role` (Bedrock, S3, SQS, SES, CognitoReadOnly, Textract, SSM) |
 | EC2 instance profile | `lablumen-ec2-profile` |
 | Security group | `sg-0cd62be1c32705ec0` (`lablumen-sg`; ports 22, 80, 8001–8003) |
 
@@ -59,7 +64,7 @@ docker-compose DB); ingestion runs inside report-service for this single-instanc
 | Appointments list | ✅ | Own (patient) / all (staff). |
 | Staff ops queue | ✅ | Join grid: patient/test/when/status + report state; status toggle (PATCH). |
 | Report upload | ✅ | Staff multipart upload → S3 → `lab_reports` row → background ingestion. |
-| AI ingestion | ✅ | In report-service: Textract OCR → Nova summary → chunk → Titan embeddings → pgvector. |
+| AI ingestion | ✅ | In report-service: Textract OCR → Nova Lite summary → chunk → Titan embeddings → pgvector. |
 | Report view | ✅ | Presigned S3 GET URL (120s TTL), ownership-scoped. |
 | RAG chat | ✅ | Document-scoped cosine (`<=>`) over the report's chunks + Nova answer + disclaimer. |
 | Notifications | ✅ | SQS consumer + SES email (sandbox: only verified recipients receive). |
@@ -79,6 +84,17 @@ docker-compose DB); ingestion runs inside report-service for this single-instanc
 
 ## Known limitations / notes
 
+- **Bedrock text model = `amazon.nova-lite-v1:0` (not Nova 2 Lite).** An org SCP
+  (`p-rn6vr8ok`) allows Bedrock only in **us-east-1**. Nova 2 Lite (`amazon.nova-2-lite-v1:0`)
+  has no on-demand support — it requires a cross-region inference profile (`us.`/`global.`),
+  which load-balances to us-east-2/us-west-2 and is **denied by the SCP**. Nova Lite v1 supports
+  on-demand natively in us-east-1, so we use it. For the EKS phase, either keep Nova Lite v1 or get
+  the SCP widened to permit the inference-profile regions, then switch `serverless/` + compose to
+  `us.amazon.nova-2-lite-v1:0`. Titan embeddings are on-demand in us-east-1 (unaffected).
+- **Deploying via SSM runs as `root`** — git in the `ubuntu`-owned repo then fails on "dubious
+  ownership" / can't write `.git/FETCH_HEAD`, silently leaving stale code. Always run git as the
+  repo owner: `sudo -u ubuntu git fetch/reset`, and if a root run already touched `.git`,
+  `chown -R ubuntu:ubuntu /home/ubuntu/lablumen` first. (Plain SSH as `ubuntu` has no such issue.)
 - **SES sandbox**: only verified addresses receive email. Demo as `rukesully@gmail.com`. To email
   arbitrary patients, request SES production access.
 - **Textract**: uses synchronous `detect_document_text` — best for single-page PDFs/images.
