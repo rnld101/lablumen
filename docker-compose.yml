@@ -10,7 +10,8 @@ x-service-env: &service-env
   COGNITO_USER_POOL_ID: us-east-1_3hMVOZPch
   COGNITO_APP_CLIENT_ID: 7eb2d3esnbfs3te482jgsfqp6t
   BEDROCK_EMBED_MODEL_ID: amazon.titan-embed-text-v1
-  BEDROCK_TEXT_MODEL_ID: amazon.nova-2-lite-v1:0
+  # Nova 2 Lite is inference-profile-only for on-demand: use the us. cross-region profile.
+  BEDROCK_TEXT_MODEL_ID: us.amazon.nova-2-lite-v1:0
   # Allow all origins — browser calls never leave nginx (same-origin), but this keeps
   # direct curl / Postman calls against :8001-8003 working too.
   CORS_ORIGINS: '["*"]'
