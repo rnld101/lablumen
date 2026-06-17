@@ -1,4 +1,3 @@
-from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,15 +16,8 @@ class Settings(BaseSettings):
     bedrock_embed_model_id: str = "amazon.titan-embed-text-v1"
     bedrock_text_model_id: str = "amazon.nova-2-lite-v1:0"
 
-    # Set CORS_ORIGINS=* to allow all origins, or comma-separated list of specific origins.
+    # Pass as a JSON array: CORS_ORIGINS='["*"]' or CORS_ORIGINS='["http://localhost:5173"]'
     cors_origins: list[str] = ["http://localhost:5173"]
-
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def parse_cors_origins(cls, v: object) -> list[str]:
-        if isinstance(v, str):
-            return [o.strip() for o in v.split(",") if o.strip()]
-        return v  # type: ignore[return-value]
 
 
 settings = Settings()

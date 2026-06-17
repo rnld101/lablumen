@@ -13,7 +13,7 @@ x-service-env: &service-env
   BEDROCK_TEXT_MODEL_ID: amazon.nova-2-lite-v1:0
   # Allow all origins — browser calls never leave nginx (same-origin), but this keeps
   # direct curl / Postman calls against :8001-8003 working too.
-  CORS_ORIGINS: "*"
+  CORS_ORIGINS: '["*"]'
 
 services:
   postgres:
