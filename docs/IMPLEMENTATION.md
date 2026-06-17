@@ -1,376 +1,401 @@
-# LabLumen — Implementation & Testing Runbook
+# LabLumen — EC2 + Docker Compose Testing Guide
 
-A phased path from local Docker Compose to a live EKS deployment. Execute phases **in order**;
-each ends with a **Definition of Done** gate — don't advance until it's green.
-
-```
-Phase 1  Local (docker-compose)      → prove the app boots, DB migrates+seeds, UI renders
-Phase 2  Build & push images (ECR)   → publish the three service images
-Phase 3  Terraform infra             → VPC, EKS, RDS, S3, Cognito, SQS/SES, Lambda
-Phase 4  Cluster bootstrap + GitOps  → ArgoCD, addons, deploy services, ALB
-Phase 5  AI pipeline + full E2E       → Bedrock, upload→summary→RAG chat, UI walkthrough
-```
-
-> **Read this first — what is real vs. stubbed in the scaffold.**
-> - Fully implemented: every `/healthz` + `/readyz`, `GET /api/v1/lab-tests` (public), the report
->   `view` (presign) and `chat` (RAG) endpoints, the Lambda pipeline, the Alembic schema + seed.
-> - Returns `501 Not Implemented` (signatures only): booking `POST /appointments`, list appointments,
->   appointment status, create/list patients, list reports. These are intentional next-step work.
-> - Needs AWS to exercise: anything behind auth (Cognito JWT), `report` view/chat (S3 + Bedrock),
->   notifications (SQS/SES). Locally you can fully test health, the seeded catalog, and the UI.
-> - Known wiring gaps before a clean cloud deploy are listed in **Appendix A**. Skim it now.
+Deploy and test the full stack on a single EC2 instance using Docker Compose.
+No EKS, no Terraform — just manual AWS resources and one `docker compose up`.
 
 ---
 
-## Phase 0 — Prerequisites
+## Overview
 
-You already have: **python 3.12, node 22, npm, terraform 1.15, AWS CLI** (account `130290476321`,
-region `us-east-1`). Install the rest before the phases that need them:
+What you will create manually, in order:
 
-| Tool | Needed for | Install (Windows) |
-|---|---|---|
-| **Docker Desktop** | Phase 1, 2 | https://www.docker.com/products/docker-desktop/ |
-| **kubectl** | Phase 4, 5 | `winget install Kubernetes.kubectl` |
-| **helm** | Phase 4 (ArgoCD/addons) | `winget install Helm.Helm` |
-| **eksctl** | Phase 4 (IRSA service accounts) | `winget install Weaveworks.eksctl` |
-| pnpm *(optional)* | frontend (npm works too) | `npm i -g pnpm` |
+1. IAM role for EC2 (Bedrock, S3, SQS, SES, Cognito)
+2. Cognito User Pool + App Client
+3. S3 bucket (report uploads)
+4. SQS queue (notification events)
+5. SES verified sender email
+6. Enable Bedrock model access
+7. EC2 instance (attach the IAM role)
+8. SSH in → install Docker → clone repo → fill in env values → `docker compose up`
 
-Confirm AWS identity once:
-
-```bash
-aws sts get-caller-identity        # should show account 130290476321
-```
-
-> PowerShell tip: use `curl.exe` (not `curl`, which is aliased to `Invoke-WebRequest`). The `for`
-> loops below are written for **Git Bash**; PowerShell equivalents are noted where they differ.
+Postgres and Redis run inside Docker Compose on the same instance — no RDS needed.
 
 ---
 
-## Phase 1 — Local with Docker Compose
+## Step 1 — Create the EC2 IAM Role
 
-Goal: the full backend boots, Postgres is migrated + seeded, and the SPA renders against the catalog.
+This role lets the EC2 instance call Bedrock, S3, SQS, SES, and Cognito without hardcoded keys.
 
-### 1.1 Start the stack
-
-```bash
-cd "/c/Users/RAPHEL M L/Desktop/LABSYNC"
-make up          # = docker compose up --build
-```
-
-This builds the three service images and starts: `postgres` (pgvector), `redis`, a one-shot
-`migrate` (runs `alembic upgrade head` → schema + seed), then `appointment-service` (**:8001**),
-`report-service` (**:8002**), `notification-service` (**:8003**).
-
-Watch for: `migrate` exits `0`, and each service logs `Uvicorn running on http://0.0.0.0:8000`.
-
-> No `make`? Run `docker compose up --build` directly.
-
-### 1.2 Verify migrations + seed
-
-```bash
-docker compose exec postgres psql -U lablumen -d lablumen -c "\dt"
-docker compose exec postgres psql -U lablumen -d lablumen -c "SELECT count(*) FROM lab_tests;"   # → 9
-docker compose exec postgres psql -U lablumen -d lablumen -c "\d report_embeddings"              # embedding = vector(1536)
-```
-
-### 1.3 Smoke-test the services
-
-```bash
-curl.exe http://localhost:8001/healthz        # {"status":"ok"}
-curl.exe http://localhost:8002/healthz
-curl.exe http://localhost:8003/healthz
-curl.exe http://localhost:8001/api/v1/lab-tests   # JSON array of 9 seeded tests
-```
-
-`notification-service` will log SQS poll errors and back off — **expected** locally (placeholder
-queue); it stays healthy. Protected/`501` endpoints are not exercised here (see the note at top).
-
-### 1.4 Run the unit/smoke tests
-
-```bash
-make test        # pytest in each service (boot + /healthz). Needs local Python deps:
-                 # pip install -r backend/appointment-service/requirements-dev.txt  (etc.)
-```
-
-### 1.5 Run the frontend
-
-```bash
-cd frontend
-npm install
-npm run dev      # http://localhost:5173   (or: make fe-dev, if pnpm installed)
-```
-
-Open http://localhost:5173 →
-- **Patient** dashboard: Bento grid renders; "Test Catalog" card fills from `:8001/api/v1/lab-tests`
-  (proves SPA→API wiring). Click **Preview** → the diagnostic modal opens.
-- **Staff** tab: counters + operations cards render.
-
-> If the catalog card says "start the backend," confirm `VITE_APPOINTMENT_API` (default
-> `http://localhost:8001`) and that `:8001` is up. CORS is already allowed for `:5173`.
-
-### ✅ Definition of Done — Phase 1
-- [ ] `migrate` completed; `lab_tests` has 9 rows; `report_embeddings.embedding` is `vector(1536)`.
-- [ ] All three `/healthz` return `200`; `/api/v1/lab-tests` returns the catalog.
-- [ ] SPA renders both dashboards and the preview modal; catalog card is populated.
-
-Tear down when done: `make down` (removes volumes).
+1. Open **IAM → Roles → Create role**
+2. Trusted entity: **AWS service → EC2**
+3. Attach these managed policies:
+   - `AmazonBedrockFullAccess`
+   - `AmazonS3FullAccess`
+   - `AmazonSQSFullAccess`
+   - `AmazonSESFullAccess`
+   - `AmazonCognitoReadOnly`
+4. Name it: `lablumen-ec2-role`
+5. Click **Create role**
 
 ---
 
-## Phase 2 — Build & push images to ECR
+## Step 2 — Create the Cognito User Pool
 
-### 2.1 Create the repositories (once)
+### 2a. Create the User Pool
 
-```bash
-for s in appointment-service report-service notification-service; do
-  aws ecr create-repository --repository-name "lablumen/$s" --region us-east-1 \
-    --image-scanning-configuration scanOnPush=true || true
-done
-```
+1. Open **Cognito → User Pools → Create user pool**
+2. Authentication providers: **Username and password** (Cognito user pool)
+3. Sign-in options: check **Email**
+4. Password policy: keep defaults or relax minimum length to 8
+5. Multi-factor: **No MFA** (for testing)
+6. Self-registration: **Enable** or disable — doesn't matter for CLI testing
+7. Attribute verification: **Send email message** (uses Cognito's built-in sandbox)
+8. Required attributes: add **email** as required
+9. Email provider: **Send email with Cognito** (free tier, no SES setup required here)
+10. User pool name: `lablumen-users`
+11. Skip "Hosted UI" for now
+12. Click **Create user pool**
 
-### 2.2 Authenticate Docker to ECR
+**Copy the User Pool ID** (looks like `us-east-1_AbCdEfGhI`) — you will need it.
 
-```bash
-aws ecr get-login-password --region us-east-1 \
-  | docker login --username AWS --password-stdin 130290476321.dkr.ecr.us-east-1.amazonaws.com
-```
+### 2b. Create the App Client
 
-### 2.3 Build, tag, push
+1. Inside your new user pool → **App clients → Create app client**
+2. App type: **Public client**
+3. App client name: `lablumen-app`
+4. Client secret: **Don't generate** (public client)
+5. Authentication flows: check **ALLOW_USER_PASSWORD_AUTH** and **ALLOW_REFRESH_TOKEN_AUTH**
+6. Click **Create app client**
 
-```bash
-REG=130290476321.dkr.ecr.us-east-1.amazonaws.com
-for s in appointment-service report-service notification-service; do
-  docker build -t "$REG/lablumen/$s:latest" "backend/$s"
-  docker push  "$REG/lablumen/$s:latest"
-done
-```
-
-> This mirrors `.github/workflows/build-push-ecr.yml`. Once the repo is on GitHub with an OIDC role
-> (`lablumen-gh-actions`), pushes to `main` do this automatically and bump the k8s image tags.
-
-### ✅ Definition of Done — Phase 2
-- [ ] `aws ecr list-images --repository-name lablumen/appointment-service` shows a `latest` image (×3).
+**Copy the App Client ID** (long alphanumeric string) — you will need it.
 
 ---
 
-## Phase 3 — Provision infrastructure with Terraform
+## Step 3 — Create the S3 Bucket
 
-### 3.1 Pre-flight
+1. Open **S3 → Create bucket**
+2. Bucket name: `lablumen-reports-<your-account-id>` (must be globally unique)
+   - Example: `lablumen-reports-130290476321`
+3. Region: **us-east-1**
+4. Block all public access: **leave ON** (services use presigned URLs, not public access)
+5. Versioning: off
+6. Click **Create bucket**
 
-1. **Enable Bedrock model access** (one-time, console): Bedrock → *Model access* → enable
-   **Titan Text Embeddings** (`amazon.titan-embed-text-v1`) and **Nova 2 Lite**
-   (`amazon.nova-2-lite-v1:0`) in **us-east-1**.
-2. Set a **globally-unique bucket name** in [terraform/terraform.tfvars](terraform/terraform.tfvars):
-   `reports_bucket_name = "lablumen-reports-130290476321"` (or your choice).
-3. Review **Appendix A** — add Lambda `VpcConfig`/`DATABASE_URL` and extra IRSA roles now if you want
-   a hands-off deploy; otherwise you'll wire them in Phase 4/5.
-
-### 3.2 Apply
-
-```bash
-cd terraform
-terraform init
-terraform plan -out tfplan        # review: ~VPC, EKS, RDS, S3, Cognito, SQS, SES, Lambda
-terraform apply tfplan            # ~15–25 min (EKS + RDS dominate)
-```
-
-> If the Lambda module errors while packaging Python deps, it's the `psycopg` build — set
-> `build_in_docker = true` on the `ai_lambda` module (needs Docker running) or deploy the function
-> via the SAM template in Phase 5 instead.
-
-### 3.3 Capture outputs
-
-```bash
-terraform output                  # cluster_name, rds_endpoint, reports_bucket,
-                                  # notifications_queue_url, cognito_user_pool_id, cognito_app_client_id,
-                                  # rds_master_user_secret_arn
-```
-
-### ✅ Definition of Done — Phase 3
-- [ ] `terraform apply` succeeds; `terraform output` shows all values.
-- [ ] `aws eks describe-cluster --name lablumen-eks` is `ACTIVE`; RDS instance is `available`.
+**Copy the bucket name** — you will need it.
 
 ---
 
-## Phase 4 — Cluster bootstrap, GitOps, and deploy
+## Step 4 — Create the SQS Queue
 
-### 4.1 Connect kubectl
+1. Open **SQS → Create queue**
+2. Type: **Standard**
+3. Name: `lablumen-notifications`
+4. Keep all defaults
+5. Click **Create queue**
 
-```bash
-aws eks update-kubeconfig --name lablumen-eks --region us-east-1
-kubectl get nodes                 # managed node group nodes are Ready
-```
-
-### 4.2 Service-account IAM (IRSA) for addons — see Appendix A
-
-The AWS Load Balancer Controller and the services expect IRSA-backed service accounts. Create them
-with `eksctl` (example for the LB controller):
-
-```bash
-eksctl create iamserviceaccount --cluster lablumen-eks --namespace kube-system \
-  --name aws-load-balancer-controller --attach-policy-arn arn:aws:iam::130290476321:policy/AWSLoadBalancerControllerIAMPolicy \
-  --approve --region us-east-1
-```
-
-(Repeat for `lablumen/appointment-service`, `report-service`, `notification-service` SAs, or extend
-the Terraform `identity` module — Appendix A.)
-
-### 4.3 Install ArgoCD, then apply the app-of-apps
-
-GitOps pulls from GitHub, so **push the repo first** (`git push origin main`).
-
-```bash
-kubectl create namespace argocd
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-kubectl -n argocd rollout status deploy/argocd-server
-
-kubectl apply -f k8s/root-app.yaml          # registers all apps + platform-addons
-kubectl -n argocd get applications          # watch them sync
-```
-
-### 4.4 Create per-service secrets + run DB migration
-
-The deployments mount `envFrom: secretRef: <svc>-secrets`. For a first deploy, create plain secrets
-(production path = Secrets Store CSI + Secrets Manager). Build `DATABASE_URL` from the RDS endpoint
-and the managed password:
-
-```bash
-PW=$(aws secretsmanager get-secret-value --secret-id "$(terraform -chdir=terraform output -raw rds_master_user_secret_arn)" \
-      --query SecretString --output text | python -c "import sys,json;print(json.load(sys.stdin)['password'])")
-RDS=$(terraform -chdir=terraform output -raw rds_endpoint)        # host:5432
-DB_URL="postgresql+asyncpg://lablumen:${PW}@${RDS%:*}:5432/lablumen"
-
-kubectl create namespace lablumen 2>/dev/null || true
-kubectl -n lablumen create secret generic appointment-service-secrets \
-  --from-literal=DATABASE_URL="$DB_URL" \
-  --from-literal=REDIS_URL="redis://redis.lablumen.svc.cluster.local:6379/0" \
-  --from-literal=AWS_REGION=us-east-1 \
-  --from-literal=COGNITO_USER_POOL_ID="$(terraform -chdir=terraform output -raw cognito_user_pool_id)" \
-  --from-literal=COGNITO_APP_CLIENT_ID="$(terraform -chdir=terraform output -raw cognito_app_client_id)"
-# repeat for report-service-secrets (add REPORTS_S3_BUCKET, model IDs) and notification-service-secrets
-# (add NOTIFICATIONS_QUEUE_URL, SES_SENDER_EMAIL).
-```
-
-Run migrations against RDS once (one-off Job using the published image):
-
-```bash
-kubectl -n lablumen run migrate --rm -i --restart=Never \
-  --image=130290476321.dkr.ecr.us-east-1.amazonaws.com/lablumen/appointment-service:latest \
-  --env="DATABASE_URL=$DB_URL" --command -- alembic upgrade head
-```
-
-### 4.5 Verify
-
-```bash
-kubectl -n lablumen get pods                 # all Running/Ready
-kubectl -n lablumen get ingress              # ALB address appears once the LB controller reconciles
-```
-
-Point Route 53 `api.lablumen...` at the ALB (or test via the ALB DNS), then:
-`curl.exe http://<alb-dns>/api/v1/lab-tests`.
-
-### ✅ Definition of Done — Phase 4
-- [ ] All ArgoCD Applications are `Synced/Healthy`; service pods Running.
-- [ ] Migration Job succeeded against RDS; `/api/v1/lab-tests` returns the catalog through the ALB.
+**Copy the Queue URL** — it looks like:
+`https://sqs.us-east-1.amazonaws.com/130290476321/lablumen-notifications`
 
 ---
 
-## Phase 5 — AI pipeline + full end-to-end
+## Step 5 — Verify the SES Sender Email
 
-### 5.1 Confirm the Lambda + S3 trigger
+SES starts in sandbox mode. You must verify the sender address.
 
-Terraform created the function, S3 bucket, and `s3:ObjectCreated` notification. Ensure the function
-has **`DATABASE_URL`** set and **VpcConfig** to reach RDS (Appendix A). Quick check:
+1. Open **SES → Verified identities → Create identity**
+2. Identity type: **Email address**
+3. Email address: the address you want to send FROM (e.g. `no-reply@yourdomain.com`, or any personal email you own)
+4. Click **Create identity**
+5. Check that inbox and click the verification link AWS sends you
+
+**Copy the verified email address** — you will need it.
+
+> If you do not care about actual email delivery during testing, you can leave the placeholder
+> value in docker-compose.yml. The notification service will log SES errors but stay running.
+
+---
+
+## Step 6 — Enable Bedrock Model Access
+
+1. Open **Bedrock → Model access** (left sidebar, bottom section)
+2. Click **Modify model access**
+3. Enable both:
+   - **Titan Text Embeddings v1** (`amazon.titan-embed-text-v1`)
+   - **Amazon Nova Lite** (`amazon.nova-2-lite-v1:0`)
+4. Click **Save changes**
+
+Access is granted within a few minutes. Status will change from "Available" to "Access granted."
+
+> This is required for the report-service RAG/chat features. Health checks and the lab test catalog work without Bedrock.
+
+---
+
+## Step 7 — Launch the EC2 Instance
+
+1. Open **EC2 → Launch instance**
+2. Name: `lablumen-test`
+3. AMI: **Amazon Linux 2023** (x86_64)
+4. Instance type: **t3.large** (Docker builds need RAM; t3.medium works but is slower)
+5. Key pair: create or select an existing key pair — **save the `.pem` file**
+6. Network settings:
+   - VPC: default VPC is fine
+   - Auto-assign public IP: **Enable**
+   - Security group — create new, add these inbound rules:
+
+     | Type | Port | Source |
+     |---|---|---|
+     | SSH | 22 | My IP |
+     | Custom TCP | 8001 | My IP |
+     | Custom TCP | 8002 | My IP |
+     | Custom TCP | 8003 | My IP |
+     | Custom TCP | 5173 | My IP |
+
+7. Storage: **30 GB gp3** (default 8 GB is too small for Docker images)
+8. Advanced details → IAM instance profile: select `lablumen-ec2-role`
+9. Click **Launch instance**
+
+Wait for instance state to show **Running** and status checks to pass (~2 min).
+
+**Copy the public IP address** of the instance.
+
+---
+
+## Step 8 — Connect to the Instance and Install Docker
 
 ```bash
-aws lambda get-function-configuration --function-name lablumen-ai-processing \
-  --query "{vpc:VpcConfig.SubnetIds, env:Environment.Variables}"
+# From your local machine
+ssh -i /path/to/your-key.pem ec2-user@<EC2-PUBLIC-IP>
 ```
 
-### 5.2 Create a Cognito test user + token
+Once connected:
 
 ```bash
-POOL=$(terraform -chdir=terraform output -raw cognito_user_pool_id)
-CLIENT=$(terraform -chdir=terraform output -raw cognito_app_client_id)
-aws cognito-idp admin-create-user --user-pool-id "$POOL" --username patient@example.com
-aws cognito-idp admin-set-user-password --user-pool-id "$POOL" --username patient@example.com \
-  --password 'Test12345!' --permanent
-aws cognito-idp admin-add-user-to-group --user-pool-id "$POOL" --username patient@example.com --group-name PATIENT
-# Get a JWT (USER_PASSWORD_AUTH must be enabled on the client for this CLI flow):
-aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH --client-id "$CLIENT" \
+# Install Docker
+sudo dnf update -y
+sudo dnf install -y docker git
+sudo systemctl enable docker
+sudo systemctl start docker
+sudo usermod -aG docker ec2-user
+
+# Install Docker Compose plugin
+sudo mkdir -p /usr/local/lib/docker/cli-plugins
+sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+# Re-login so the docker group takes effect
+exit
+```
+
+SSH back in:
+
+```bash
+ssh -i /path/to/your-key.pem ec2-user@<EC2-PUBLIC-IP>
+
+# Verify
+docker --version
+docker compose version
+```
+
+---
+
+## Step 9 — Clone the Repo
+
+```bash
+git clone https://github.com/<your-github-username>/lablumen.git
+cd lablumen
+```
+
+---
+
+## Step 10 — Fill in the Placeholder Values
+
+Edit `docker-compose.yml` and replace the placeholder values with the real ones you collected:
+
+```bash
+nano docker-compose.yml
+```
+
+Find the `x-service-env` block near the top and update:
+
+```yaml
+x-service-env: &service-env
+  DATABASE_URL: postgresql+asyncpg://lablumen:lablumen@postgres:5432/lablumen
+  REDIS_URL: redis://redis:6379/0
+  AWS_REGION: us-east-1
+  COGNITO_USER_POOL_ID: us-east-1_AbCdEfGhI          # ← your User Pool ID
+  COGNITO_APP_CLIENT_ID: 3abc123def456ghi789          # ← your App Client ID
+  BEDROCK_EMBED_MODEL_ID: amazon.titan-embed-text-v1
+  BEDROCK_TEXT_MODEL_ID: amazon.nova-2-lite-v1:0
+```
+
+Find the `report-service` block and update:
+
+```yaml
+  report-service:
+    ...
+    environment:
+      <<: *service-env
+      REPORTS_S3_BUCKET: lablumen-reports-130290476321  # ← your bucket name
+      PRESIGNED_URL_TTL_SECONDS: "120"
+```
+
+Find the `notification-service` block and update:
+
+```yaml
+  notification-service:
+    ...
+    environment:
+      <<: *service-env
+      NOTIFICATIONS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/130290476321/lablumen-notifications  # ← your queue URL
+      SES_SENDER_EMAIL: no-reply@yourdomain.com         # ← your verified SES email
+```
+
+Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X` in nano).
+
+---
+
+## Step 11 — Configure the Frontend (optional, for UI testing)
+
+```bash
+cp frontend/.env.example frontend/.env
+nano frontend/.env
+```
+
+Replace the values:
+
+```env
+VITE_APPOINTMENT_API=http://<EC2-PUBLIC-IP>:8001
+VITE_REPORT_API=http://<EC2-PUBLIC-IP>:8002
+
+VITE_COGNITO_USER_POOL_ID=us-east-1_AbCdEfGhI
+VITE_COGNITO_APP_CLIENT_ID=3abc123def456ghi789
+VITE_COGNITO_DOMAIN=https://lablumen-users.auth.us-east-1.amazoncognito.com
+```
+
+> The Cognito domain follows the pattern `https://<user-pool-name>.auth.<region>.amazoncognito.com`.
+> Check it under Cognito → your user pool → App integration → Domain.
+
+---
+
+## Step 12 — Start the Stack
+
+```bash
+cd ~/lablumen
+docker compose up --build
+```
+
+First run takes 5–10 minutes (builds images, installs pip deps). Watch for:
+
+- `migrate` container exits with code `0` — means DB schema + seed applied
+- Each service logs: `Uvicorn running on http://0.0.0.0:8000`
+
+To run in background after first build:
+
+```bash
+docker compose up -d
+docker compose logs -f   # tail logs
+```
+
+---
+
+## Step 13 — Smoke Test
+
+From your **local machine** (not the EC2 terminal), run:
+
+```bash
+# Replace with your EC2 public IP
+EC2=<EC2-PUBLIC-IP>
+
+curl http://$EC2:8001/healthz          # → {"status":"ok"}
+curl http://$EC2:8002/healthz          # → {"status":"ok"}
+curl http://$EC2:8003/healthz          # → {"status":"ok"}
+curl http://$EC2:8001/api/v1/lab-tests # → JSON array of 9 lab tests
+```
+
+---
+
+## Step 14 — Create a Test Cognito User
+
+Run this from your **local machine** (needs AWS CLI configured):
+
+```bash
+POOL_ID=us-east-1_AbCdEfGhI          # your User Pool ID
+CLIENT_ID=3abc123def456ghi789         # your App Client ID
+
+# Create user
+aws cognito-idp admin-create-user \
+  --user-pool-id "$POOL_ID" \
+  --username patient@example.com \
+  --region us-east-1
+
+# Set a permanent password (skips the forced-reset flow)
+aws cognito-idp admin-set-user-password \
+  --user-pool-id "$POOL_ID" \
+  --username patient@example.com \
+  --password 'Test12345!' \
+  --permanent \
+  --region us-east-1
+
+# Get a JWT token
+TOKEN=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id "$CLIENT_ID" \
   --auth-parameters USERNAME=patient@example.com,PASSWORD='Test12345!' \
-  --query 'AuthenticationResult.IdToken' --output text
+  --region us-east-1 \
+  --query 'AuthenticationResult.IdToken' \
+  --output text)
+
+echo $TOKEN   # long JWT string
 ```
 
-Use the token as `Authorization: Bearer <token>` against protected endpoints.
-
-### 5.3 Exercise the RAG pipeline
-
-1. Seed a `lab_reports` row whose `s3_url` equals the object key you'll upload (the Lambda matches on
-   it), via a real appointment→mapping, or a manual insert for testing.
-2. Upload a single-page report PDF/PNG:
-   `aws s3 cp sample-report.pdf s3://<reports_bucket>/reports/sample-report.pdf`
-3. The S3 event triggers `lablumen-ai-processing` → Textract → Nova summary → Titan embeddings.
-   Verify: `ai_layman_summary` populated and `report_embeddings` rows created for that `report_id`.
-4. Chat (scoped RAG):
-   ```bash
-   curl.exe -X POST http://<alb-dns>/api/v1/reports/<report_id>/chat \
-     -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-     -d '{"question":"What does my cholesterol result mean?"}'
-   ```
-   Expect an answer grounded in that report's chunks + the not-medical-advice disclaimer.
-
-### 5.4 UI walkthrough
-Build/host the SPA (S3 + CloudFront per the blueprint, or `npm run preview`), set its `VITE_*` env to
-the ALB + Cognito values, log in, and click through Patient → preview modal → chat.
-
-### ✅ Definition of Done — Phase 5
-- [ ] Upload produces a summary + embeddings; scoped `chat` returns a grounded answer.
-- [ ] An authenticated user completes the journey in the UI.
-
----
-
-## Teardown
+Test an authenticated endpoint:
 
 ```bash
-kubectl delete -f k8s/root-app.yaml                     # remove apps (ALBs) before infra
-cd terraform && terraform destroy                       # empty the S3 bucket first if not force_destroy
-for s in appointment-service report-service notification-service; do
-  aws ecr delete-repository --repository-name "lablumen/$s" --force --region us-east-1; done
+curl -H "Authorization: Bearer $TOKEN" http://$EC2:8002/api/v1/reports
 ```
 
 ---
 
-## Appendix A — Known wiring gaps (complete these for a clean cloud run)
+## Step 15 — Test the Frontend (optional)
 
-The scaffold is intentionally lean; these are the deliberate next-step items:
+From the EC2 instance, build and serve the frontend:
 
-1. **Lambda → RDS**: add `vpc_config` (private subnets + a SG allowed into RDS:5432) and
-   `DATABASE_URL` to the `ai_lambda` module in [terraform/modules/storage/main.tf](terraform/modules/storage/main.tf).
-   Without VpcConfig the function cannot reach private RDS.
-2. **IRSA for all services**: the `identity` module creates only the `report-service` role. Add roles
-   for `appointment-service` (SQS publish), `notification-service` (SQS consume + SES), the
-   **AWS Load Balancer Controller**, and the **Karpenter** controller SA, then put each role ARN into
-   the chart's `serviceAccount.annotations` (`k8s/apps/<svc>/values.yaml`).
-3. **Secrets via CSI**: replace the plain `kubectl create secret` (Phase 4.4) with a
-   `SecretProviderClass` per service so Secrets Manager values mount automatically.
-4. **Image tags**: charts default to `:latest`. For real GitOps rollouts, let the CI tag-bump commit
-   pin a SHA (already in [.github/workflows/build-push-ecr.yml](.github/workflows/build-push-ecr.yml)),
-   which requires the `lablumen-gh-actions` OIDC role + an ECR push policy.
-5. **Cognito client auth flow**: enable `ALLOW_USER_PASSWORD_AUTH` on the app client if you use the
-   CLI token flow in 5.2 (Hosted UI / SRP needs no change).
-6. **Stubbed endpoints**: implement the `501` routes (booking with the Redis slot-lock + SQS event,
-   patients, report listing) — this is the planned post-scaffold work.
+```bash
+cd ~/lablumen/frontend
+npm install
+npm run build
+npm run preview -- --host 0.0.0.0 --port 5173
+```
 
-## Appendix B — Troubleshooting
+Then open `http://<EC2-PUBLIC-IP>:5173` in your browser.
 
-| Symptom | Likely cause / fix |
+---
+
+## Summary of Values to Collect
+
+| Value | Where to find it | Used in |
+|---|---|---|
+| Cognito User Pool ID | Cognito → User pools → your pool → Overview | docker-compose.yml, frontend/.env |
+| Cognito App Client ID | Cognito → your pool → App clients | docker-compose.yml, frontend/.env |
+| Cognito Domain | Cognito → your pool → App integration → Domain | frontend/.env |
+| S3 Bucket Name | S3 → your bucket name | docker-compose.yml (report-service) |
+| SQS Queue URL | SQS → your queue → URL | docker-compose.yml (notification-service) |
+| SES Sender Email | SES → Verified identities | docker-compose.yml (notification-service) |
+| EC2 Public IP | EC2 → your instance → Public IPv4 | frontend/.env, curl test commands |
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
 |---|---|
-| `migrate` exits non-zero | DB not ready — Compose waits on health, but on first run retry `make migrate`. |
-| Catalog card empty in UI | `:8001` down or `VITE_APPOINTMENT_API` wrong; check browser console/CORS. |
-| Service pod `CreateContainerConfigError` | `<svc>-secrets` missing in `lablumen` ns (Phase 4.4). |
-| Ingress has no address | LB controller not installed or its IRSA SA missing (Appendix A.2). |
-| Chat returns 404 | No `lab_reports` row for that `report_id`, or user isn't owner/staff. |
-| Bedrock `AccessDenied` | Model access not enabled (Phase 3.1) or missing `bedrock:InvokeModel` IAM. |
-| Lambda times out on DB | Missing VpcConfig/SG to RDS (Appendix A.1). |
-| ArgoCD app `OutOfSync`/`Unknown` | Repo not pushed to GitHub, or `repoURL`/`targetRevision` mismatch. |
+| `migrate` exits non-zero | Postgres not ready yet. Run `docker compose restart migrate` |
+| Service crashes with `COGNITO_USER_POOL_ID` error | You have the old placeholder value — check docker-compose.yml |
+| `curl` to port 8001 times out | EC2 security group is missing the inbound rule for that port |
+| Bedrock `AccessDenied` | Model access not enabled (Step 6) or EC2 role missing `AmazonBedrockFullAccess` |
+| SES `MessageRejected` | Sender email not verified, or recipient is not verified (sandbox mode) |
+| SQS `AccessDenied` | EC2 role missing `AmazonSQSFullAccess` |
+| Frontend can't reach API | `VITE_APPOINTMENT_API` uses `localhost` — must be the EC2 public IP |
+| `notification-service` logs SQS errors but stays up | Expected if queue URL is still placeholder; doesn't block other features |
+| Docker build fails out of disk | Instance storage too small — stop and increase EBS volume to 30 GB |
