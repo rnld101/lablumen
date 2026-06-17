@@ -51,3 +51,17 @@ async def get_current_user(
         email=claims.get("email"),
         groups=claims.get("cognito:groups", []) or [],
     )
+
+
+def require_roles(*roles: str):
+    """Dependency factory enforcing membership in at least one Cognito group."""
+
+    async def _checker(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+        if not set(roles).intersection(user.groups):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires one of roles: {', '.join(roles)}",
+            )
+        return user
+
+    return _checker

@@ -12,3 +12,13 @@ def generate_presigned_get_url(object_key: str) -> str:
         Params={"Bucket": settings.reports_s3_bucket, "Key": object_key},
         ExpiresIn=settings.presigned_url_ttl_seconds,
     )
+
+
+def put_object(object_key: str, data: bytes, content_type: str) -> None:
+    """Upload report bytes to the private reports bucket."""
+    _s3.put_object(
+        Bucket=settings.reports_s3_bucket,
+        Key=object_key,
+        Body=data,
+        ContentType=content_type,
+    )

@@ -1,9 +1,26 @@
+import datetime
+import uuid
+
 from pydantic import BaseModel
 
 
 class ReportViewOut(BaseModel):
     url: str
     expires_in: int
+
+
+class ReportListItem(BaseModel):
+    report_id: uuid.UUID
+    test_name: str
+    patient_name: str
+    created_at: datetime.datetime
+    has_summary: bool
+    summary: str | None = None
+
+
+class ReportUploadOut(BaseModel):
+    report_id: uuid.UUID
+    status: str
 
 
 class ChatTurn(BaseModel):

@@ -7,18 +7,36 @@ context never bleeds across patients.
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    status,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..auth import CurrentUser, get_current_user
+from ..auth import CurrentUser, get_current_user, require_roles
 from ..bedrock import embed_text, generate_answer
 from ..config import settings
 from ..db import get_session
-from ..s3 import generate_presigned_get_url
-from ..schemas import ChatRequest, ChatResponse, ReportViewOut
+from ..ingestion import process_report
+from ..s3 import generate_presigned_get_url, put_object
+from ..schemas import (
+    ChatRequest,
+    ChatResponse,
+    ReportListItem,
+    ReportUploadOut,
+    ReportViewOut,
+)
 
 router = APIRouter(tags=["reports"])
+
+require_staff = require_roles("LAB_STAFF", "LAB_ADMIN")
 
 _DISCLAIMER = (
     "This AI explanation is for general understanding only and is not medical advice. "
@@ -54,9 +72,90 @@ async def _resolve_report_key(
     return row[0] if row else None
 
 
-@router.get("/reports", response_model=list[dict])
-async def list_my_reports(user: CurrentUser = Depends(get_current_user)) -> list[dict]:
-    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "Not implemented in scaffold")
+@router.get("/reports", response_model=list[ReportListItem])
+async def list_my_reports(
+    user: CurrentUser = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[ReportListItem]:
+    """List reports visible to the caller (staff see all; patients see only their own)."""
+    is_staff = bool({"LAB_STAFF", "LAB_ADMIN"}.intersection(user.groups))
+    base = (
+        "SELECT lr.report_id, lt.name AS test_name, "
+        "(pp.first_name || ' ' || pp.last_name) AS patient_name, "
+        "lr.created_at, lr.ai_layman_summary "
+        "FROM lab_reports lr "
+        "JOIN appointment_test_mapping atm ON atm.mapping_id = lr.mapping_id "
+        "JOIN lab_tests lt ON lt.test_id = atm.test_id "
+        "JOIN patient_profiles pp ON pp.patient_id = atm.patient_id "
+        "JOIN appointments a ON a.appointment_id = atm.appointment_id "
+    )
+    params: dict[str, str] = {}
+    if not is_staff:
+        base += "WHERE a.account_owner_id = CAST(:uid AS uuid) "
+        params["uid"] = user.sub
+    base += "ORDER BY lr.created_at DESC"
+
+    rows = (await session.execute(text(base), params)).mappings().all()
+    return [
+        ReportListItem(
+            report_id=r["report_id"],
+            test_name=r["test_name"],
+            patient_name=r["patient_name"],
+            created_at=r["created_at"],
+            has_summary=r["ai_layman_summary"] is not None,
+            summary=r["ai_layman_summary"],
+        )
+        for r in rows
+    ]
+
+
+@router.post("/reports/upload", response_model=ReportUploadOut, status_code=status.HTTP_201_CREATED)
+async def upload_report(
+    background: BackgroundTasks,
+    mapping_id: uuid.UUID = Form(...),
+    file: UploadFile = File(...),
+    _staff: CurrentUser = Depends(require_staff),
+    session: AsyncSession = Depends(get_session),
+) -> ReportUploadOut:
+    """Staff-only: upload a report PDF/image for an ordered test, then process it (OCR -> summary
+    -> embeddings) in the background. One report per mapping (lab_reports.mapping_id is unique)."""
+    # The ordered test must exist and not already have a report.
+    mapping = (
+        await session.execute(
+            text("SELECT mapping_id FROM appointment_test_mapping WHERE mapping_id = :mid"),
+            {"mid": str(mapping_id)},
+        )
+    ).first()
+    if mapping is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Ordered test (mapping) not found")
+    existing = (
+        await session.execute(
+            text("SELECT report_id FROM lab_reports WHERE mapping_id = :mid"),
+            {"mid": str(mapping_id)},
+        )
+    ).first()
+    if existing is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "A report already exists for this order")
+
+    report_id = uuid.uuid4()
+    suffix = (file.filename or "").rsplit(".", 1)
+    ext = suffix[1].lower() if len(suffix) == 2 else "pdf"
+    key = f"reports/{report_id}.{ext}"
+
+    data = await file.read()
+    put_object(key, data, file.content_type or "application/octet-stream")
+
+    await session.execute(
+        text(
+            "INSERT INTO lab_reports (report_id, mapping_id, s3_url) "
+            "VALUES (CAST(:rid AS uuid), CAST(:mid AS uuid), :key)"
+        ),
+        {"rid": str(report_id), "mid": str(mapping_id), "key": key},
+    )
+    await session.commit()
+
+    background.add_task(process_report, str(report_id), key)
+    return ReportUploadOut(report_id=report_id, status="processing")
 
 
 @router.get("/reports/{report_id}/view", response_model=ReportViewOut)
