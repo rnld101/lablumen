@@ -26,9 +26,11 @@ export function Layout() {
         <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
           <span className="text-lg font-semibold text-primary">LabLumen</span>
           <nav className="flex items-center gap-2">
-            <NavLink to="/" className={linkClass} end>
-              Patient
-            </NavLink>
+            {!isStaff && (
+              <NavLink to="/" className={linkClass} end>
+                Patient
+              </NavLink>
+            )}
             {isStaff && (
               <NavLink to="/staff" className={linkClass}>
                 Staff

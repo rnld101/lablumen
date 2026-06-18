@@ -5,8 +5,10 @@ Access is scoped: staff (LAB_STAFF/LAB_ADMIN) may view any report; patients only
 context never bleeds across patients.
 """
 
+import logging
 import uuid
 
+import botocore.exceptions
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -19,6 +21,8 @@ from fastapi import (
 )
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 from ..auth import CurrentUser, get_current_user, require_roles
 from ..bedrock import embed_text, generate_answer
@@ -143,16 +147,31 @@ async def upload_report(
     key = f"reports/{report_id}.{ext}"
 
     data = await file.read()
-    put_object(key, data, file.content_type or "application/octet-stream")
+    try:
+        put_object(key, data, file.content_type or "application/octet-stream")
+    except botocore.exceptions.ClientError as exc:
+        error_msg = exc.response["Error"]["Message"]
+        logger.error("S3 upload failed for key=%s: %s", key, error_msg)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"S3 upload failed: {error_msg}") from exc
+    except botocore.exceptions.NoCredentialsError as exc:
+        logger.error("S3 upload failed — no AWS credentials available")
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "S3 upload failed: no AWS credentials — check that the EC2 instance profile is attached",
+        ) from exc
 
-    await session.execute(
-        text(
-            "INSERT INTO lab_reports (report_id, mapping_id, s3_url) "
-            "VALUES (CAST(:rid AS uuid), CAST(:mid AS uuid), :key)"
-        ),
-        {"rid": str(report_id), "mid": str(mapping_id), "key": key},
-    )
-    await session.commit()
+    try:
+        await session.execute(
+            text(
+                "INSERT INTO lab_reports (report_id, mapping_id, s3_url) "
+                "VALUES (CAST(:rid AS uuid), CAST(:mid AS uuid), :key)"
+            ),
+            {"rid": str(report_id), "mid": str(mapping_id), "key": key},
+        )
+        await session.commit()
+    except Exception as exc:
+        logger.error("DB insert failed for report_id=%s: %s", report_id, exc)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"Database error: {exc}") from exc
 
     background.add_task(process_report, str(report_id), key)
     return ReportUploadOut(report_id=report_id, status="processing")

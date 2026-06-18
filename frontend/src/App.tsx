@@ -15,9 +15,14 @@ const router = createBrowserRouter([
     element: <ProtectedRoute />,
     children: [
       {
-        path: "/",
-        element: <Layout />,
-        children: [{ index: true, element: <PatientDashboard /> }],
+        element: <ProtectedRoute patientOnly />,
+        children: [
+          {
+            path: "/",
+            element: <Layout />,
+            children: [{ index: true, element: <PatientDashboard /> }],
+          },
+        ],
       },
       {
         element: <ProtectedRoute staffOnly />,
