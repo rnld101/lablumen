@@ -12,20 +12,24 @@ document-scoped RAG chat are all implemented and wired. The S3-triggered Lambda 
 `serverless/` is intentionally parked for the future EKS migration (it can't reach the
 docker-compose DB); ingestion runs inside report-service for this single-instance setup.
 
-**✅ Verified end-to-end on 2026-06-18** (live, against http://54.198.249.16): login + RBAC,
-patient profile + booking, booking→SQS→SES email (SES: sent, 0 bounces), staff ops queue +
-status update, report upload → Textract OCR → Nova Lite summary → Titan embeddings → pgvector,
-presigned PDF view, and grounded RAG chat. Patient→staff and no-token requests correctly 403.
+**✅ Verified end-to-end on 2026-06-18** against a live EC2: login + RBAC, patient profile +
+booking, booking→SQS→SES email (SES: sent, 0 bounces), staff ops queue + status update, report
+upload → Textract OCR → Nova Lite summary → Titan embeddings → pgvector, presigned PDF view,
+and grounded RAG chat. Patient→staff and no-token requests correctly 403.
 
 ## Deployment
 
 - **Model**: single EC2 (Ubuntu 24.04) running `docker compose`. nginx serves the SPA on :80 and
   reverse-proxies `/api/v1/*` to the services (same-origin → no CORS).
-- **Instance**: `i-062daf1d4c5193613` — public IP **54.198.249.16** (region us-east-1).
-- **App URL**: http://54.198.249.16
+- **Instance**: **terminated** — relaunch per `docs/IMPLEMENTATION.md` Step 2.
+- **App URL**: `http://<NEW-EC2-PUBLIC-IP>` (set after each launch)
 - **Deploy / redeploy** (on the instance):
   ```bash
-  cd ~/lablumen && git pull origin main && docker compose up --build -d
+  # Run git as ubuntu — SSM/root breaks .git ownership
+  sudo chown -R ubuntu:ubuntu /home/ubuntu/lablumen   # only needed if root touched .git
+  cd /home/ubuntu/lablumen
+  sudo -u ubuntu git pull origin main
+  sudo -u ubuntu docker compose up --build -d
   ```
 - Repo: https://github.com/rnld101/lablumen (branch `main`).
 
