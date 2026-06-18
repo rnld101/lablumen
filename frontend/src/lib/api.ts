@@ -71,6 +71,11 @@ export interface ReportView {
   expires_in: number;
 }
 
+export interface ChatHistoryItem {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface ChatResponse {
   answer: string;
   disclaimer: string;
@@ -143,9 +148,9 @@ export const api = {
       { method: "POST", body: form },
     );
   },
-  chatWithReport: (reportId: string, question: string) =>
+  chatWithReport: (reportId: string, question: string, history: ChatHistoryItem[] = []) =>
     request<ChatResponse>(`${REPORT_API}/api/v1/reports/${reportId}/chat`, {
       method: "POST",
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, history }),
     }),
 };

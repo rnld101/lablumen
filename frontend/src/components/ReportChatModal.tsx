@@ -32,11 +32,17 @@ export function ReportChatModal({ open, reportId, reportName, onClose }: ReportC
     const question = input.trim();
     if (!question || sending) return;
     setError(null);
+    // Snapshot history before adding the new user message so the backend gets
+    // all prior turns (user + assistant) as context.
+    const history = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
     setMessages((m) => [...m, { role: "user", content: question }]);
     setInput("");
     setSending(true);
     try {
-      const res = await api.chatWithReport(reportId, question);
+      const res = await api.chatWithReport(reportId, question, history);
       setMessages((m) => [...m, { role: "assistant", content: res.answer }]);
       setDisclaimer(res.disclaimer);
       requestAnimationFrame(() => scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight));

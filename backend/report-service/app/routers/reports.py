@@ -34,6 +34,7 @@ from ..schemas import (
     _FAILED_SENTINEL,
     ChatRequest,
     ChatResponse,
+    ChatTurn,
     ReportListItem,
     ReportUploadOut,
     ReportViewOut,
@@ -74,7 +75,10 @@ WHAT YOU MUST NOT DO
 (e.g., how to make money, celebrity trivia, explicit content, current news).
 - Provide a definitive diagnosis ("you have condition X").
 - Recommend specific prescription medications or dosages.
-- Invent lab values — only cite numbers that appear in the provided context.
+- When citing specific test values, use only the numbers from the provided report context. \
+For health guidance questions (diet, lifestyle, supplements, symptoms), use your medical \
+knowledge freely — the report tells you *what* the findings are; your training tells you \
+*what to do about them*.
 
 GUARDRAIL — TRULY OFF-TOPIC REQUESTS
 Only if a question has absolutely no connection to the patient's health, lab results, \
@@ -290,14 +294,16 @@ async def chat_with_report(
         )
     ).scalars().all()
 
-    # Build context: summary gives the AI the full picture; chunks give precise values.
+    # Build context: summary always leads (full clinical picture); chunks add precise values.
     context_parts: list[str] = []
     if summary_text:
-        context_parts.append(f"Report summary:\n{summary_text}")
+        context_parts.append(
+            f"Patient's report summary (use this to understand their findings):\n{summary_text}"
+        )
     if chunk_rows:
-        context_parts.append("Relevant report sections:\n" + "\n\n".join(chunk_rows))
+        context_parts.append("Most relevant report sections:\n" + "\n\n".join(chunk_rows))
     context_block = "\n\n".join(context_parts) if context_parts else "(no report context available)"
 
     user_prompt = f"Report context:\n{context_block}\n\nPatient question: {payload.question}"
-    answer = generate_answer(_SYSTEM_PROMPT, user_prompt)
+    answer = generate_answer(_SYSTEM_PROMPT, user_prompt, payload.history or None)
     return ChatResponse(answer=answer, disclaimer=_DISCLAIMER)
