@@ -1,3 +1,4 @@
+import typography from "@tailwindcss/typography";
 import type { Config } from "tailwindcss";
 
 // Bento design tokens from BLUEPRINT.md section 3 (clinical light-mode, overrides dark themes).
@@ -24,5 +25,5 @@ export default {
       },
     },
   },
-  plugins: [],
+  plugins: [typography],
 } satisfies Config;

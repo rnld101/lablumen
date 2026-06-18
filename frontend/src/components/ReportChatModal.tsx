@@ -1,5 +1,6 @@
 import { Send, X } from "lucide-react";
 import { useRef, useState } from "react";
+import Markdown from "react-markdown";
 
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
@@ -16,7 +17,6 @@ interface ReportChatModalProps {
   onClose: () => void;
 }
 
-// Document-scoped RAG chat: questions are answered only from this report's embedded chunks.
 export function ReportChatModal({ open, reportId, reportName, onClose }: ReportChatModalProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -67,8 +67,8 @@ export function ReportChatModal({ open, reportId, reportName, onClose }: ReportC
         <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto bg-surface p-4">
           {messages.length === 0 && (
             <p className="text-sm text-text-muted">
-              Ask a question like “What does my cholesterol result mean?” — answers come only from
-              this report.
+              Ask anything about your results — what they mean, what to eat, lifestyle tips, or
+              even ask for a translation into your language.
             </p>
           )}
           {messages.map((m, i) => (
@@ -80,10 +80,14 @@ export function ReportChatModal({ open, reportId, reportName, onClose }: ReportC
                 className={
                   m.role === "user"
                     ? "max-w-[80%] rounded-bento bg-primary px-3 py-2 text-sm text-white"
-                    : "max-w-[80%] whitespace-pre-wrap rounded-bento bg-white px-3 py-2 text-sm text-text-dark shadow-bento-diffused"
+                    : "prose prose-sm max-w-[80%] rounded-bento bg-white px-3 py-2 text-sm text-text-dark shadow-bento-diffused"
                 }
               >
-                {m.content}
+                {m.role === "assistant" ? (
+                  <Markdown>{m.content}</Markdown>
+                ) : (
+                  m.content
+                )}
               </div>
             </div>
           ))}
