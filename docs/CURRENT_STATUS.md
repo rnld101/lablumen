@@ -1,20 +1,24 @@
 # LabLumen — Current Status
 
 > Living document. Update this whenever the deployment, resources, or feature state change.
-> Last updated: 2026-06-18.
+> Last updated: 2026-06-20.
 
 ## TL;DR
 
 Full product runs end-to-end on a single EC2 instance via docker-compose (nginx :80 →
 3 FastAPI services + Postgres/pgvector + Redis). Auth wall (Cognito), patient booking, staff
-operations + report upload, AI ingestion (Textract → Nova summary → Titan embeddings), and
+operations + report upload, AI ingestion (pypdf → Nova summary → Titan embeddings), and
 document-scoped RAG chat are all implemented and wired. The S3-triggered Lambda in
 `serverless/` is intentionally parked for the future EKS migration (it can't reach the
 docker-compose DB); ingestion runs inside report-service for this single-instance setup.
 
+The frontend has been fully redesigned: 10+ routes under persistent sidebars (PatientLayout /
+StaffLayout), a multi-step booking wizard, and the flagship **Report Workspace** (`/app/reports/:id`)
+— PDF-primary layout with AI summary panel, biomarker strip, and floating chat button.
+
 **✅ Verified end-to-end on 2026-06-18** against a live EC2: login + RBAC, patient profile +
 booking, booking→SQS→SES email (SES: sent, 0 bounces), staff ops queue + status update, report
-upload → Textract OCR → Nova Lite summary → Titan embeddings → pgvector, presigned PDF view,
+upload → pypdf extraction → Nova Lite summary → Titan embeddings → pgvector, presigned PDF view,
 and grounded RAG chat. Patient→staff and no-token requests correctly 403.
 
 ## Deployment
@@ -66,13 +70,16 @@ and grounded RAG chat. Patient→staff and no-token requests correctly 403.
 | Patient profiles | ✅ | Create/list; booking is per-profile. |
 | Booking | ✅ | Redis slot-lock, multi-test cost total, slot picker, price snapshot, `appointment.booked` → SQS → SES email. |
 | Appointments list | ✅ | Own (patient) / all (staff). |
-| Staff ops queue | ✅ | Join grid: patient/test/when/status + report state; status toggle (PATCH). |
-| Report upload | ✅ | Staff multipart upload → S3 → `lab_reports` row → background ingestion. |
-| AI ingestion | ✅ | In report-service: Textract OCR → Nova Lite summary → chunk → Titan embeddings → pgvector. |
+| Staff ops queue | ✅ | Join grid: patient/test/when/status + report state; status toggle (PATCH). Staff-only guard enforced. |
+| Report upload | ✅ | Staff multipart upload → S3 → `lab_reports` row → background ingestion. S3/DB errors surfaced in UI. |
+| AI ingestion | ✅ | In report-service: **pypdf** text extraction → Nova Lite summary → chunk → Titan embeddings → pgvector. |
 | Report view | ✅ | Presigned S3 GET URL (120s TTL), ownership-scoped. |
-| RAG chat | ✅ | Document-scoped cosine (`<=>`) over the report's chunks + Nova answer + disclaimer. |
+| RAG chat | ✅ | Multi-turn history, document-scoped cosine (`<=>`) over report chunks + Nova answer. Markdown rendered. Concise nurse persona; no repetitive sign-offs. |
 | Notifications | ✅ | SQS consumer + SES email (sandbox: only verified recipients receive). |
+| Frontend redesign | ✅ | 10+ routes, PatientLayout/StaffLayout sidebars, BookingWizard, Report Workspace. See `docs/FRONTEND_VISION.md`. |
+| Report Workspace UI | ✅ | PDF primary (full left panel), AI summary right, floating chat button (FAB). Biomarker strip, AI status hero. |
 | S3→Lambda ingestion | ⏸ Parked | Complete code in `serverless/ai-processing-pipeline/`; can't reach the compose DB. For EKS phase. |
+| EKS migration | 📋 Planned | Architecture blueprint written: `docs/EKS_MIGRATION_BLUEPRINT.md`. 9-phase plan (P0–P9). |
 
 ## End-to-end demo script
 
@@ -101,7 +108,8 @@ and grounded RAG chat. Patient→staff and no-token requests correctly 403.
   `chown -R ubuntu:ubuntu /home/ubuntu/lablumen` first. (Plain SSH as `ubuntu` has no such issue.)
 - **SES sandbox**: only verified addresses receive email. Demo as `rukesully@gmail.com`. To email
   arbitrary patients, request SES production access.
-- **Textract**: uses synchronous `detect_document_text` — best for single-page PDFs/images.
+- **PDF extraction**: switched from Textract `detect_document_text` to **pypdf** for text
+  extraction inside the compose stack. Textract is still used in the parked Lambda pipeline.
 - **Ingestion** runs as a FastAPI BackgroundTask (no queue/retry). Fine for the demo; the EKS path
   uses the S3-triggered Lambda instead.
 - **Secrets**: IDs live in `docker-compose.yml` for this test setup; production uses Secrets
@@ -112,7 +120,15 @@ and grounded RAG chat. Patient→staff and no-token requests correctly 403.
 
 - Code layout: `backend/{appointment,report,notification}-service/app`, `frontend/src`,
   `serverless/ai-processing-pipeline` (EKS-bound), `terraform/`, `k8s/`.
-- Implementation runbook: `docs/IMPLEMENTATION.md`. Original blueprint context in git history.
-- Next milestones (not done yet): SES production access; move ingestion to the Lambda for EKS;
-  Secrets Store CSI; the Terraform/EKS deploy (`docs/IMPLEMENTATION.md` Phases 3–5 from the
-  original plan); finish any remaining polish on appointment cancellation flows.
+- Implementation runbook: `docs/IMPLEMENTATION.md`. EKS migration blueprint: `docs/EKS_MIGRATION_BLUEPRINT.md`.
+- Frontend design spec: `docs/FRONTEND_VISION.md` (source of truth for layouts and components).
+
+### Next milestones
+
+| Priority | Item |
+|---|---|
+| 1 | **SES production access** — unblock real-patient email delivery |
+| 2 | **EKS Phase 3 — P0/P1** — Terraform remote state + VPC 3-tier (`docs/EKS_MIGRATION_BLUEPRINT.md`) |
+| 3 | **Lambda AI pipeline** — attach VPC config to `ai_lambda`; retire inline `report-service` AI path (EKS P6) |
+| 4 | **Appointment cancellation** — patient-side cancel flow not yet implemented |
+| 5 | **Secrets Manager** — move `docker-compose.yml` env vars to Secrets Manager for EKS readiness |
